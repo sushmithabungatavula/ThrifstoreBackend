@@ -255,4 +255,210 @@ router.put('/admin/approve', async (req, res) => {
 });
 
 
+
+
+
+/**
+ * @route GET /returns/customer/:customer_id
+ * @description Get all return requests for a specific customer
+ * @param {string} customer_id - The ID of the customer
+ * @returns {object} List of return requests with order details
+ */
+router.get('/returns/:customer_id', async (req, res) => {
+  const { customer_id } = req.params;
+  
+  try {
+    const query = `
+      SELECT rr.*, o.order_date, o.order_status, o.item_id, o.item_quantity, o.item_price
+      FROM returnrequest rr
+      JOIN orders o ON rr.order_id = o.order_id
+      WHERE o.customer_id = ?
+      ORDER BY rr.request_date DESC
+    `;
+    
+    const [returns] = await db.query(query, [customer_id]);
+    
+    if (!returns || returns.length === 0) {
+      return res.status(404).json({ message: "No return requests found for this customer" });
+    }
+    
+    res.json(returns);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+/**
+ * @route GET /returns/:return_id
+ * @description Get detailed information about a specific return request
+ * @param {string} return_id - The ID of the return request
+ * @returns {object} Return request details with order and refund information
+ */
+router.get('/:return_id', async (req, res) => {
+  const { return_id } = req.params;
+  
+  try {
+    const [returnRequest] = await db.query(`
+      SELECT rr.*, o.*, rf.refund_amount, rf.refund_date, rf.status as refund_status, rf.comment
+      FROM returnrequest rr
+      JOIN orders o ON rr.order_id = o.order_id
+      LEFT JOIN refund rf ON rr.order_id = rf.order_id
+      WHERE rr.return_id = ?
+    `, [return_id]);
+    
+    if (!returnRequest || returnRequest.length === 0) {
+      return res.status(404).json({ message: "Return request not found" });
+    }
+    
+    res.json(returnRequest[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+/**
+ * @route PUT /returns/:return_id/status
+ * @description Update the status of a return request
+ * @param {string} return_id - The ID of the return request
+ * @body {string} status - New status for the return
+ * @body {string} [comment] - Optional comment about the status change
+ * @returns {object} Updated return request information
+ */
+router.put('/:return_id/status', async (req, res) => {
+  const { return_id } = req.params;
+  const { status, comment } = req.body;
+  
+  if (!status) {
+    return res.status(400).json({ message: "Status is required" });
+  }
+  
+  try {
+    // First check if return exists
+    const [existingReturn] = await db.query(
+      'SELECT * FROM returnrequest WHERE return_id = ?', 
+      [return_id]
+    );
+    
+    if (!existingReturn || existingReturn.length === 0) {
+      return res.status(404).json({ message: "Return request not found" });
+    }
+    
+    // Update return status
+    await db.query(
+      `UPDATE returnrequest 
+       SET status = ?, 
+           ${comment ? 'comment = ?' : ''}
+       WHERE return_id = ?`,
+      comment ? [status, comment, return_id] : [status, return_id]
+    );
+    
+    // If status is being updated to "approved", also update the order status
+    if (status.toLowerCase() === 'approved') {
+      await db.query(
+        `UPDATE orders SET order_status = 'returned' WHERE order_id = ?`,
+        [existingReturn[0].order_id]
+      );
+    }
+    
+    res.json({ 
+      message: "Return status updated successfully",
+      return_id,
+      status,
+      order_id: existingReturn[0].order_id,
+      comment: comment || null
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+/**
+ * @route GET /returns
+ * @description Get all return requests (for admin dashboard)
+ * @query {string} [status] - Filter by status (optional)
+ * @returns {object} List of all return requests with customer and order info
+ */
+router.get('/returns', async (req, res) => {
+  const { status } = req.query;
+  
+  try {
+    let query = `
+      SELECT rr.*, o.customer_id, o.order_date, o.item_id, o.item_quantity, 
+             o.item_price, c.name as customer_name, c.email as customer_email
+      FROM returnrequest rr
+      JOIN orders o ON rr.order_id = o.order_id
+      JOIN customer c ON o.customer_id = c.customer_id
+    `;
+    
+    const params = [];
+    
+    if (status) {
+      query += ' WHERE rr.status = ?';
+      params.push(status);
+    }
+    
+    query += ' ORDER BY rr.request_date DESC';
+    
+    const [returns] = await db.query(query, params);
+    
+    res.json(returns || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+/**
+ * @route PUT /returns/:return_id/reason
+ * @description Update the reason for a return request
+ * @param {string} return_id - The ID of the return request
+ * @body {string} return_reason - New reason for the return
+ * @returns {object} Updated return request information
+ */
+router.put('/:return_id/reason', async (req, res) => {
+  const { return_id } = req.params;
+  const { return_reason } = req.body;
+  
+  if (!return_reason) {
+    return res.status(400).json({ message: "Return reason is required" });
+  }
+  
+  try {
+    // First check if return exists and hasn't been processed yet
+    const [existingReturn] = await db.query(
+      `SELECT * FROM returnrequest 
+       WHERE return_id = ? AND (status IS NULL OR status = '')`,
+      [return_id]
+    );
+    
+    if (!existingReturn || existingReturn.length === 0) {
+      return res.status(400).json({ 
+        message: "Return request not found or already processed" 
+      });
+    }
+    
+    // Update return reason
+    await db.query(
+      `UPDATE returnrequest SET return_reason = ? WHERE return_id = ?`,
+      [return_reason, return_id]
+    );
+    
+    res.json({ 
+      message: "Return reason updated successfully",
+      return_id,
+      return_reason
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
 module.exports = router;
