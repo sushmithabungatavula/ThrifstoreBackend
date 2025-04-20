@@ -844,7 +844,7 @@ router.put('/order/:order_id', async (req, res) => {
 
 
 // Fetch all orders by customer_id and group them by order_id
-router.get('/orders/:customer_id', async (req, res) => {
+router.get('/ordersByCustomer/:customer_id', async (req, res) => {
   const { customer_id } = req.params;
 
   try {
@@ -873,76 +873,104 @@ router.get('/orders/:customer_id', async (req, res) => {
 });
 
 
+// Helper function to generate JWT
+const generateToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET || '244139saiTeja', { expiresIn: '10h' });
+};
 
 
 
+// Vendor Signup
 router.post('/vendor/signup', async (req, res) => {
   try {
-    const { name, email, phone } = req.body;
+    const { name, email, phone, password } = req.body;
 
-    // Check if email already exists
-    const [existingVendor] = await db.query('SELECT * FROM vendor WHERE email = ?', [email]);
-    if (existingVendor.length > 0) {
+    // basic validation
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email and password are all required' });
+    }
+
+    // check email uniqueness
+    const [existing] = await db.query(
+      'SELECT 1 FROM vendor WHERE email = ? LIMIT 1',
+      [email]
+    );
+    if (existing.length) {
       return res.status(400).json({ message: 'Email already exists' });
     }
 
-    // Insert new vendor into the database
+    // hash the password
+    const saltRounds = 10;
+    const hashed = await bcrypt.hash(password, saltRounds);
+
+    // insert new vendor including hashed password
     const [result] = await db.query(
-      'INSERT INTO vendor (name, email, phone) VALUES (?, ?, ?)', 
-      [name, email, phone]
+      `INSERT INTO vendor (name, email, password)
+       VALUES (?,       ?,     ?)`,
+      [name, email, hashed]
     );
 
-    // Return success message along with a generated token
-    const token = generateToken(result.insertId);  // Assuming this generates a token with vendor id
+    // generate auth token
+    const token = generateToken(result.insertId);
+
     res.status(201).json({
       vendor_id: result.insertId,
       name,
       email,
       token
     });
-  } catch (error) {
-    console.error('Error during vendor signup:', error);
-    res.status(500).json({ error: error.message });
+
+  } catch (err) {
+    console.error('Error during vendor signup:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
 
-// Vendor Login route (POST)
+// Vendor Login
 router.post('/vendor/login', async (req, res) => {
-  const { name, email } = req.body;
-
-  if (!name || !email) {
-    return res.status(400).json({ message: 'Name and email are required' });
-  }
-
   try {
-    // Check if the vendor exists using both name and email
-    const [rows] = await db.query('SELECT * FROM vendor WHERE name = ? AND email = ?', [name, email]);
-    
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+
+    // look up vendor by email
+    const [rows] = await db.query(
+      `SELECT vendor_id, name, email, password
+       FROM vendor
+       WHERE email = ?
+       LIMIT 1`,
+      [email]
+    );
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Vendor not found' });
     }
 
     const vendor = rows[0];
 
-    // Since there is no password in the request payload, you don't need to compare the password here
-    // You can assume the login is based on name and email match
-    
-    // Generate a token (for authentication)
-    const token = generateToken(vendor.id);
+    // compare submitted password to stored hash
+    const match = await bcrypt.compare(password, vendor.password);
+    if (!match) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
 
-    // Return the token and vendor details
+    // generate new token
+    const token = generateToken(vendor.vendor_id);
+
     res.json({
-      id: vendor.vendor_id,
-      name: vendor.name,
-      email: vendor.email,
+      vendor_id: vendor.vendor_id,
+      name:      vendor.name,
+      email:     vendor.email,
       token
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+
+  } catch (err) {
+    console.error('Error during vendor login:', err);
+    res.status(500).json({ error: err.message });
   }
 });
-
 
 
 
@@ -1027,10 +1055,7 @@ const createCrudRoutes = (tableName) => {
 
 
 
-// Helper function to generate JWT
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET || '244139saiTeja', { expiresIn: '10h' });
-};
+
 
 
 // POST /signup
