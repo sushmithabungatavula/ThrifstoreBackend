@@ -110,6 +110,168 @@ router.post('/shipping', async (req, res) => {
 });
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/payments
+// Return every row in the `payment` table
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/payments', async (req, res) => {
+  try {
+    const [payments] = await db.query(
+      `SELECT 
+         payment_id,
+         payment_amount,
+         payment_date,
+         payment_method,
+         status,
+         order_id,
+         payment_type,
+         total_balance_vendor,
+         vendor_id
+       FROM payment`
+    );
+    res.json(payments);
+  } catch (err) {
+    console.error('Error fetching payments:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/refunds
+// Return every row in the `refund` table
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/refunds', async (req, res) => {
+  try {
+    const [refunds] = await db.query(
+      `SELECT
+         refund_id,
+         order_id,
+         return_id,
+         refund_amount,
+         refund_date,
+         status,
+         comment
+       FROM refund`
+    );
+    res.json(refunds);
+  } catch (err) {
+    console.error('Error fetching refunds:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+/**
+ * @route POST /api/orders/:order_id/payment
+ * @desc  Record a payment for a completed order (idempotent)
+ */
+router.post('/:order_id/payment', async (req, res) => {
+  const { order_id } = req.params;
+  const {
+    payment_amount,
+    payment_method,
+    status,
+    payment_type,
+    vendor_id
+  } = req.body;
+
+  if (
+    payment_amount == null ||
+    !payment_method ||
+    !status ||
+    !payment_type ||
+    !vendor_id
+  ) {
+    return res
+      .status(400)
+      .json({ message: 'Missing one of payment_amount, payment_method, status, payment_type or vendor_id' });
+  }
+
+  const payment_date = new Date().toISOString();
+
+  try {
+    // ── 0) idempotency check ─────────────────────────
+    // if we've already recorded a payment for this order+type, return it
+    const [existingRows] = await db.query(
+      `SELECT * FROM payment
+         WHERE order_id = ? AND payment_type = ?`,
+      [order_id, payment_type]
+    );
+    if (existingRows.length > 0) {
+      return res.status(200).json({
+        message: 'Payment already recorded',
+        payment: existingRows[0]
+      });
+    }
+
+    // ── 1) fetch last balance for this vendor ────────────
+    const [[lastRow]] = await db.query(
+      `SELECT total_balance_vendor
+         FROM payment
+        WHERE vendor_id = ?
+        ORDER BY payment_date DESC
+        LIMIT 1`,
+      [vendor_id]
+    );
+
+    let currentBalance;
+    if (lastRow) {
+      currentBalance = Number(lastRow.total_balance_vendor);
+    } else {
+      // no prior payment rows → sum all past credits
+      const [[sumRow]] = await db.query(
+        `SELECT COALESCE(SUM(payment_amount), 0) AS sum_credits
+           FROM payment
+          WHERE vendor_id = ?
+            AND payment_type = 'credit'`,
+        [vendor_id]
+      );
+      currentBalance = Number(sumRow.sum_credits);
+    }
+
+    // ── 2) compute new balance ───────────────────────────
+    const newBalance = currentBalance + Number(payment_amount);
+
+    // ── 3) insert the new payment row ────────────────────
+    const payment_id = generateRandomId();
+    await db.query(
+      `INSERT INTO payment
+         (payment_id, payment_amount, payment_date,
+          payment_method, status,
+          order_id, payment_type, total_balance_vendor, vendor_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        payment_id,
+        payment_amount,
+        payment_date,
+        payment_method,
+        status,
+        order_id,
+        payment_type,
+        newBalance,
+        vendor_id
+      ]
+    );
+
+    return res.status(201).json({
+      payment_id,
+      order_id,
+      payment_amount,
+      payment_date,
+      payment_method,
+      status,
+      payment_type,
+      total_balance_vendor: newBalance,
+      vendor_id
+    });
+  } catch (err) {
+    console.error('Error recording payment:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 
 router.post('/cancel', async (req, res) => {
@@ -140,7 +302,7 @@ router.post('/cancel', async (req, res) => {
     await db.query(
       `INSERT INTO returnrequest (return_id, order_id, return_reason, status, request_date)
        VALUES (?, ?, ?, ?, ?)`,
-      [return_id, order_id, return_reason, '', request_date]
+      [return_id, order_id, return_reason, 'placed', request_date]
     );
 
     // Send success response
@@ -171,7 +333,8 @@ router.put('/admin/approve', async (req, res) => {
     status,
     refund_amount,
     payment_method,
-    comment = ""      
+    comment = "",
+    vendor_id
   } = req.body;
 
   /* ---------- validation ---------- */
@@ -254,20 +417,55 @@ if (rfUpdate.affectedRows === 0) {
 
     /* ---------- 3. payment row (only when approved) ---------- */
     if (status.toLowerCase() === "approved") {
+      // 3a) fetch the last balance for this vendor
+      const [[lastRow]] = await conn.query(
+        `SELECT total_balance_vendor
+           FROM payment
+          WHERE vendor_id = ?
+          ORDER BY payment_date DESC
+          LIMIT 1`,
+        [vendor_id]
+      );
+      const prevBalance = Number(lastRow?.total_balance_vendor || 0);
+      const newBalance  = prevBalance - Number(refund_amount);
+    
+      // 3b) try updating any existing payment for this order
       const [payUpdate] = await conn.query(
         `UPDATE payment
-            SET payment_amount = ?, payment_method = ?, status = ?, payment_date = ?
-          WHERE order_id = ? AND return_id = ?`,
-        [refund_amount, payment_method, status, payment_date, order_id, return_id]
+           SET payment_amount         = ?,
+               payment_method         = ?,
+               status                 = ?,
+               payment_date           = ?,
+               total_balance_vendor   = ?
+         WHERE order_id = ?`,
+        [refund_amount, payment_method, status, payment_date, newBalance, order_id]
       );
-
+    
+      // 3c) if none existed, insert a fresh debit record
       if (payUpdate.affectedRows === 0) {
         await conn.query(
           `INSERT INTO payment
-             (payment_id, order_id, return_id, payment_amount, payment_date, payment_method, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [generateRandomId(), order_id, return_id,
-           refund_amount, payment_date, payment_method, status]
+             (payment_id,
+              order_id,
+              payment_amount,
+              payment_date,
+              payment_type,
+              payment_method,
+              total_balance_vendor,
+              vendor_id,
+              status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            generateRandomId(),
+            order_id,
+            refund_amount,
+            payment_date,
+            'debit',
+            payment_method,
+            newBalance,
+            vendor_id,
+            status
+          ]
         );
       }
     }
@@ -286,7 +484,7 @@ if (rfUpdate.affectedRows === 0) {
     });
   } catch (err) {
     await conn.rollback();
-    console.message("approve-cancel error:", err);
+    
     res.status(500).json({ error: err.message });
   } finally {
     conn.release();
