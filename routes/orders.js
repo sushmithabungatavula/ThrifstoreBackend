@@ -162,82 +162,117 @@ router.post('/cancel', async (req, res) => {
 
 
 
-router.put('/admin/approve', async (req, res) => {
-  const { order_id, return_id, status, refund_amount, payment_method, comment } = req.body;
 
-  // Validate required fields.
-  if (!order_id || !return_id || !status || refund_amount === undefined || comment === undefined) {
+
+router.put('/admin/approve', async (req, res) => {
+  const {
+    order_id,
+    return_id,
+    status,
+    refund_amount,
+    payment_method,
+    comment = ""      
+  } = req.body;
+
+  /* ---------- validation ---------- */
+  if (!order_id || !status ||
+      refund_amount === undefined || comment === "")
+  {
     return res.status(400).json({
-      message: "order_id, return_id, status, refund_amount, and comment are required."
+      message: "order_id, return_id, status, refund_amount and comment are required."
     });
   }
-
-  // For approved status, payment_method is required.
   if (status.toLowerCase() === "approved" && !payment_method) {
     return res.status(400).json({
       message: "payment_method is required when status is approved."
     });
   }
 
-  // Use the current date for refund_date (ISO format).
-  const refund_date = new Date().toISOString();
+  const refund_date   = new Date().toISOString();
+  const payment_date  = refund_date;               // keep both in sync
+  const conn          = await db.getConnection();  // << use a single connection
 
   try {
-    // Query the returnrequest table to verify that both the provided return_id
-    // and order_id are matching in the same row.
-    const [returnRecords] = await db.query(
-      `SELECT status FROM returnrequest WHERE return_id = ? AND order_id = ?`,
+    await conn.beginTransaction();
+
+    /* ---------- 1. ensure a return request row exists ---------- */
+    const [rr] = await conn.query(
+      `SELECT status
+         FROM returnrequest
+        WHERE return_id = ? AND order_id = ?`,
       [return_id, order_id]
     );
 
-    // If no record exists, return a 404 error.
-    if (!returnRecords || returnRecords.length === 0) {
-      return res.status(404).json({ message: "Return request not found for the given order_id and return_id." });
-    }
-
-    // Check if the return request is already approved.
-    const existingStatus = returnRecords[0].status;
-    if (existingStatus && existingStatus.toLowerCase() === "approved") {
-      return res.status(400).json({ message: "Return request is already approved." });
-    }
-
-    // Update the returnrequest table with the new status.
-    await db.query(
-      `UPDATE returnrequest 
-       SET status = ?
-       WHERE return_id = ? AND order_id = ?`,
-      [status, return_id, order_id]
-    );
-
-    // Update the refund table: update if a record exists with the given order_id,
-    // and set the comment provided by the admin.
-    const [refundResult] = await db.query(
-      `UPDATE refund 
-       SET refund_amount = ?, refund_date = ?, status = ?, comment = ?
-       WHERE order_id = ?`,
-      [refund_amount, refund_date, status, comment, order_id]
-    );
-
-    // If no record was updated, insert a new refund record.
-    if (refundResult.affectedRows === 0) {
-      const refund_id = generateRandomId();
-      await db.query(
-        `INSERT INTO refund (refund_id, order_id, refund_amount, refund_date, status, comment)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [refund_id, order_id, refund_amount, refund_date, status, comment]
+    if (rr.length === 0) {
+      await conn.query(
+        `INSERT INTO returnrequest
+           (return_id, order_id, status, created_at)
+         VALUES (?, ?, ?, ?)`,
+        [return_id, order_id, status, refund_date]
+      );
+    } else if (rr[0].status?.toLowerCase() === "approved") {
+      return res.status(400).json({ message: "Return request already approved." });
+    } else  {
+      await conn.query(
+        `UPDATE returnrequest
+            SET status = ?
+          WHERE return_id = ? AND order_id = ?`,
+        [status, return_id, order_id]
       );
     }
 
-    // If the status is approved, insert a record into the payment table.
+    /* ---------- 2. refund row ---------- */
+   // UPDATE with backticks
+const [rfUpdate] = await conn.query(
+  `UPDATE \`refund\`
+      SET \`refund_amount\` = ?,
+          \`refund_date\`   = ?,
+          \`status\`        = ?,
+          \`comment\`       = ?
+    WHERE \`order_id\`      = ?
+      AND \`return_id\`     = ?`,
+  [refund_amount, refund_date, status, comment, order_id, return_id]
+);
+
+// INSERT with backticks
+if (rfUpdate.affectedRows === 0) {
+  await conn.query(
+    `INSERT INTO \`refund\`
+       (\`refund_id\`, \`order_id\`, \`return_id\`,
+        \`refund_amount\`, \`refund_date\`, \`status\`, \`comment\`)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [ generateRandomId(),
+      order_id,
+      return_id,
+      refund_amount,
+      refund_date,
+      status,
+      comment
+    ]
+  );
+}
+
+    /* ---------- 3. payment row (only when approved) ---------- */
     if (status.toLowerCase() === "approved") {
-      const payment_date = new Date().toISOString();
-      const payment_id = generateRandomId();
-      await db.query(
-        `INSERT INTO payment (payment_id, order_id, payment_amount, payment_date, payment_method, status)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [payment_id, order_id, refund_amount, payment_date, payment_method, status]
+      const [payUpdate] = await conn.query(
+        `UPDATE payment
+            SET payment_amount = ?, payment_method = ?, status = ?, payment_date = ?
+          WHERE order_id = ? AND return_id = ?`,
+        [refund_amount, payment_method, status, payment_date, order_id, return_id]
       );
+
+      if (payUpdate.affectedRows === 0) {
+        await conn.query(
+          `INSERT INTO payment
+             (payment_id, order_id, return_id, payment_amount, payment_date, payment_method, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [generateRandomId(), order_id, return_id,
+           refund_amount, payment_date, payment_method, status]
+        );
+      }
     }
+
+    await conn.commit();
 
     res.json({
       message: "Approval processed successfully.",
@@ -249,11 +284,14 @@ router.put('/admin/approve', async (req, res) => {
       comment,
       payment_method: status.toLowerCase() === "approved" ? payment_method : undefined
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    await conn.rollback();
+    console.message("approve-cancel error:", err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
   }
 });
-
 
 
 

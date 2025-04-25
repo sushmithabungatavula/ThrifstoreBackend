@@ -8,6 +8,67 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid'); 
 
 
+
+
+router.post('/employee', async (req, res) => {
+  const { employee_id, name, email, phone, role, vendor_id, status } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO employee (employee_id, name, email, phone, role, vendor_id, status) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [employee_id, name, email, phone, role, vendor_id, status]
+    );
+
+    res.status(201).json({ message: 'Employee added', employee_id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+router.put('/employee/:employee_id', async (req, res) => {
+  const { employee_id } = req.params;
+  const { name, email, phone, role, vendor_id, status } = req.body;
+
+  try {
+    const [result] = await db.query(
+      `UPDATE employee 
+       SET name = ?, email = ?, phone = ?, role = ?, vendor_id = ?, status = ?
+       WHERE employee_id = ?`,
+      [name, email, phone, role, vendor_id, status, employee_id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+
+    res.json({ message: 'Employee updated', employee_id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+router.delete('/employee/:employee_id', async (req, res) => {
+  const { employee_id } = req.params;
+
+  try {
+    const [result] = await db.query('DELETE FROM employee WHERE employee_id = ?', [employee_id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+
+    res.json({ message: 'Employee deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 // Fetch a specific address by addressId
 router.get('/address/:addressId', async (req, res) => {
   const { addressId } = req.params;
